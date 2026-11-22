@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import math
+
 __all__ = [
     "find_pulse",
     "roundtrip_delay",
@@ -52,7 +54,24 @@ def find_pulse(samples, threshold):
     ----
     本函数按样本精确定位，不做插值；下游允许 1 个样本的误差。
     """
-    raise NotImplementedError("find_pulse 的契约见 docstring，待实现")
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError("threshold must be within [0.0, 1.0]")
+
+    peak = 0.0
+    for x in samples:
+        magnitude = abs(x)
+        if magnitude > peak:
+            peak = magnitude
+
+    # 全零块（含空块）：有效阈值为 0，严格大于判定下任何零值都不算越过。
+    if peak == 0.0:
+        return -1
+
+    effective = threshold * peak
+    for i, x in enumerate(samples):
+        if abs(x) > effective:
+            return i
+    return -1
 
 
 def roundtrip_delay(sent, received, threshold, sample_rate):
@@ -88,7 +107,22 @@ def roundtrip_delay(sent, received, threshold, sample_rate):
     在整数样本构造的信号上，返回值与真值的误差不超过 1 个样本
     （``1000 / sample_rate`` ms）。
     """
-    raise NotImplementedError("roundtrip_delay 的契约见 docstring，待实现")
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive")
+
+    sent_index = find_pulse(sent, threshold)
+    received_index = find_pulse(received, threshold)
+    if sent_index < 0:
+        raise ValueError("no pulse detected in sent block")
+    if received_index < 0:
+        raise ValueError("no pulse detected in received block")
+
+    roundtrip_samples = received_index - sent_index
+    if roundtrip_samples < 0:
+        raise ValueError("received pulse precedes sent pulse")
+
+    # 索引差是往返总延迟，折半才是输出/输入各一段的单程延迟。
+    return roundtrip_samples / 2.0 / sample_rate * 1000.0
 
 
 def drift_estimate(offsets, sample_rate):
@@ -121,7 +155,13 @@ def drift_estimate(offsets, sample_rate):
     ----
     对严格线性的输入，返回值是精确斜率；测试允许 1e-9 的浮点误差。
     """
-    raise NotImplementedError("drift_estimate 的契约见 docstring，待实现")
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive")
+    if len(offsets) < 2:
+        raise ValueError("at least two offsets are required")
+
+    elapsed_seconds = len(offsets) - 1
+    return (offsets[-1] - offsets[0]) / elapsed_seconds
 
 
 def compensate(samples, delay_samples):
@@ -153,7 +193,24 @@ def compensate(samples, delay_samples):
     ----
     平移量按整数样本执行，补偿后的脉冲位置允许 ±1 个样本的残差。
     """
-    raise NotImplementedError("compensate 的契约见 docstring，待实现")
+    n = len(samples)
+    if n == 0:
+        return []
+
+    shift = int(round(delay_samples))
+
+    # 平移量不小于块长时，所有原始样本都被移出窗口，结果是等长全零。
+    if abs(shift) >= n:
+        return [0.0] * n
+
+    if shift > 0:
+        # 正延迟：内容偏晚，左移 shift 个样本并在尾部补零。
+        return list(samples[shift:]) + [0.0] * shift
+    if shift < 0:
+        # 负延迟：内容偏早，右移 |shift| 个样本，在开头补零并丢弃尾部。
+        pad = -shift
+        return [0.0] * pad + list(samples[: n - pad])
+    return list(samples)
 
 
 def clock_offset(delays, nominal):
@@ -179,9 +236,15 @@ def clock_offset(delays, nominal):
 
     容差
     ----
-    使用算术平均；测试允许 1e-6 ppm 的相对误差。
+        使用算术平均；测试允许 1e-6 ppm 的相对误差。
     """
-    raise NotImplementedError("clock_offset 的契约见 docstring，待实现")
+    if len(delays) == 0:
+        raise ValueError("delays must not be empty")
+    if nominal <= 0:
+        raise ValueError("nominal must be positive")
+
+    mean_delay = sum(delays) / len(delays)
+    return (mean_delay / nominal - 1.0) * 1_000_000.0
 
 
 def stability(delays):
@@ -209,9 +272,32 @@ def stability(delays):
 
     容差
     ----
-    测试使用 1e-9 的绝对误差。
+        测试使用 1e-9 的绝对误差。
     """
-    raise NotImplementedError("stability 的契约见 docstring，待实现")
+    n = len(delays)
+    if n == 0:
+        raise ValueError("delays must not be empty")
+    if n == 1:
+        return 0.0
+
+    mean_delay = sum(delays) / n
+    if mean_delay == 0.0:
+        return 0.0 if all(x == 0.0 for x in delays) else 1.0
+
+    variance = sum((x - mean_delay) ** 2 for x in delays) / n
+    coefficient = math.sqrt(variance) / abs(mean_delay)
+    # 相对离散度本身非负，只需截断上界；保留 max 以防浮点产生极小负值。
+    return min(1.0, max(0.0, coefficient))
+
+
+def _median(values):
+    """返回序列的中位数（偶数项取中间两项的算术平均）。"""
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2 == 1:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
 def validate_measure(delays, sample_rate):
@@ -248,7 +334,27 @@ def validate_measure(delays, sample_rate):
     ----
     离群判定是确定性的，不使用随机数。
     """
-    raise NotImplementedError("validate_measure 的契约见 docstring，待实现")
+    if len(delays) == 0:
+        return ["no delay measurements"]
+
+    issues = []
+
+    if sample_rate <= 0:
+        issues.append("sample_rate must be positive")
+
+    for i, value in enumerate(delays):
+        if value < 0:
+            issues.append(f"negative delay at index {i}: {value}")
+
+    if len(delays) >= 3:
+        median = _median(delays)
+        mad = _median([abs(x - median) for x in delays])
+        cutoff = max(3.0 * mad, 0.05 * abs(median), 1e-9)
+        for i, value in enumerate(delays):
+            if abs(value - median) > cutoff:
+                issues.append(f"outlier delay at index {i}: {value}")
+
+    return issues
 
 
 def calibrate_batch(devices, config):
@@ -288,4 +394,31 @@ def calibrate_batch(devices, config):
     批量结果必须与逐台单独调用 :func:`clock_offset`、:func:`stability`、
     :func:`validate_measure` 的结果一致（浮点比较允许 1e-9）。
     """
-    raise NotImplementedError("calibrate_batch 的契约见 docstring，待实现")
+    sample_rate = config["sample_rate"]
+    nominal_ms = config["nominal_ms"]
+    if sample_rate <= 0:
+        raise ValueError("sample_rate must be positive")
+    if nominal_ms <= 0:
+        raise ValueError("nominal_ms must be positive")
+
+    results = {}
+    for device in devices:
+        name = device["name"]
+        if not name:
+            raise ValueError("device name must not be empty")
+        if name in results:
+            raise ValueError(f"duplicate device name: {name}")
+
+        delays = device["delays"]
+        if len(delays) == 0:
+            raise ValueError(f"device {name} has no delay measurements")
+
+        # 所有中间量都在本轮循环内重新计算，绝不跨设备复用。
+        results[name] = {
+            "mean_delay_ms": sum(delays) / len(delays),
+            "clock_offset_ppm": clock_offset(delays, nominal_ms),
+            "stability": stability(delays),
+            "issues": validate_measure(delays, sample_rate),
+        }
+
+    return results
